@@ -4,7 +4,7 @@ PPM3 GUI — Positioning of Proteins in Membranes (v3.0)
 macOS M2 compatible. Pure stdlib — no pip installs needed.
 
 Launch:
-    python3 ppm3_gui.py
+    python3 ppm3_gui4.py
 """
 
 import tkinter as tk
@@ -12,9 +12,12 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 import subprocess, threading, os, sys, shutil
 from pathlib import Path
 from datetime import datetime
+from html import escape
+import re
 
 # ── Membrane types ─────────────────────────────────────────────────────────────
 MEMBRANE_CODES = [
+    ("   ", "Undefined membrane"),
     ("PMm", "Plasma membrane (mammalian)"),
     ("PMp", "Plasma membrane (plants)"),
     ("PMf", "Plasma membrane (fungi)"),
@@ -32,7 +35,6 @@ MEMBRANE_CODES = [
     ("GnI", "Gram-negative bacteria inner membrane"),
     ("GpI", "Gram-positive bacteria inner membrane"),
     ("ARC", "Archaebacteria cell membrane"),
-    ("   ", "Undefined membrane"),
     ("LPC", "DLPC (diC12:0 PC) bilayer"),
     ("MPC", "DMPC (diC14:0 PC) bilayer"),
     ("OPC", "DOPC (diC18:1 PC) bilayer"),
@@ -177,16 +179,19 @@ class SingleMemCard(tk.Frame):
         tk.Label(r, text="N-term topology:", font=F["small"],
                  fg=C["dim"], bg=C["card"],
                  width=18, anchor="e").pack(side="left", padx=(0, 8))
+        topo_wrap = tk.Frame(r, bg=C["card"])
+        topo_wrap.pack(side="left", fill="x", expand=True)
         for val, desc in [
             ("in",  "in  (N-terminus faces inside membrane)"),
             ("out", "out  (N-terminus faces outside membrane)"),
         ]:
-            tk.Radiobutton(r, text=desc,
+            tk.Radiobutton(topo_wrap, text=desc,
                            variable=self._topo, value=val,
                            bg=C["card"], fg=C["text"],
                            selectcolor=C["card"],
                            activebackground=C["card"],
-                           font=F["body"]).pack(side="left", padx=(0, 24))
+                           anchor="w",
+                           font=F["body"]).pack(anchor="w")
 
     def _browse_pdb(self):
         p = filedialog.askopenfilename(
@@ -306,8 +311,9 @@ class MemSubBlock(tk.Frame):
         code  = MEM_TO_CODE.get(self._mem.get(), "MOM").strip() or "MOM"
         lines = [code, self._shape.get(), self._topo.get()]
         ch    = self._chains.get().strip()
-        if ch:
-            lines.append(ch)
+        # opm.f always reads an extra free-form line for subunit chain IDs.
+        # Keep a placeholder blank line when no chains are provided.
+        lines.append(ch)
         return lines
 
 
@@ -381,6 +387,7 @@ class DualMemCard(tk.Frame):
                   ).pack(anchor="w", pady=(4, 8))
 
         self._add_sub()
+        self._add_sub()
 
     def _browse(self):
         p = filedialog.askopenfilename(
@@ -440,9 +447,21 @@ class PPM3App(tk.Tk):
         self._workdir = tk.StringVar(value=str(Path.home()))
         self._mode    = tk.IntVar(value=1)
         self._cards   = []
+        self._bulk_pdbs = []
+        self._bulk_active = False
+        self._bulk_mem = tk.StringVar(value=MEM_DISPLAY[9])  # MOM default
+        self._bulk_het = tk.IntVar(value=1)
+        self._bulk_topo = tk.StringVar(value="out")
+        self._bulk_mem1 = tk.StringVar(value=MEM_DISPLAY[9])
+        self._bulk_shape1 = tk.StringVar(value="planar")
+        self._bulk_topo1 = tk.StringVar(value="in")
+        self._bulk_mem2 = tk.StringVar(value=MEM_DISPLAY[9])
+        self._bulk_shape2 = tk.StringVar(value="planar")
+        self._bulk_topo2 = tk.StringVar(value="in")
         self._running = False
         self._proc    = None
         self._last_run_dir = ""
+        self._run_output_lines = []
 
         apply_ttk_style()
         self._build()
@@ -592,6 +611,16 @@ class PPM3App(tk.Tk):
 
         btn_frame = tk.Frame(hdr, bg=C["bg"])
         btn_frame.pack(side="right")
+        tk.Button(btn_frame, text="📁  Import PDB Folder",
+                  command=self._import_pdb_folder,
+                  bg=C["border"], fg=C["text"], relief="flat",
+                  font=F["small"], cursor="hand2", bd=0,
+                  padx=8, pady=4).pack(side="right", padx=(6, 0))
+        tk.Button(btn_frame, text="📄  Select PDB File(s)",
+                  command=self._import_pdb_files,
+                  bg=C["border"], fg=C["text"], relief="flat",
+                  font=F["small"], cursor="hand2", bd=0,
+                  padx=8, pady=4).pack(side="right", padx=(6, 0))
         tk.Button(btn_frame, text="Clear All",
                   command=self._clear_cards,
                   bg=C["border"], fg=C["text"], relief="flat",
@@ -606,7 +635,31 @@ class PPM3App(tk.Tk):
         self._card_cont = tk.Frame(wrap, bg=C["bg"])
         self._card_cont.pack(fill="x")
 
+        bulk = tk.Frame(wrap, bg=C["panel"],
+                        highlightbackground=C["border"], highlightthickness=1)
+        bulk.pack(fill="x", pady=(6, 0))
+        self._batch_panel = bulk
+        self._batch_cfg = tk.Frame(bulk, bg=C["panel"])
+        self._batch_cfg.pack(fill="x", padx=12, pady=10)
+        self._bulk_info = tk.StringVar(value="No batch folder imported.")
+        tk.Label(self._batch_cfg, textvariable=self._bulk_info, bg=C["panel"], fg=C["dim"],
+                 font=F["small"]).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self._render_batch_controls()
+
         self._add_card()
+        self._refresh_jobs_layout()
+
+    def _refresh_jobs_layout(self):
+        if self._bulk_active:
+            if self._card_cont.winfo_ismapped():
+                self._card_cont.pack_forget()
+            if not self._batch_panel.winfo_ismapped():
+                self._batch_panel.pack(fill="x", pady=(6, 0))
+        else:
+            if not self._card_cont.winfo_ismapped():
+                self._card_cont.pack(fill="x")
+            if self._batch_panel.winfo_ismapped():
+                self._batch_panel.pack_forget()
 
     # ── Run section ────────────────────────────────────────────────────────────
     def _build_run(self, parent):
@@ -697,12 +750,20 @@ class PPM3App(tk.Tk):
         self._res_lbl.pack(fill="x")
 
     # ── Card management ────────────────────────────────────────────────────────
-    def _add_card(self):
+    def _add_card(self, pdb_path=None):
+        self._bulk_active = False
+        self._bulk_pdbs = []
+        self._bulk_info.set("No batch folder imported.")
+        self._refresh_jobs_layout()
         idx = len(self._cards)
         if self._mode.get() == 1:
             c = SingleMemCard(self._card_cont, idx, remove_cb=self._remove_card)
+            if pdb_path:
+                c._pdb.set(pdb_path)
         else:
             c = DualMemCard(self._card_cont, idx, remove_cb=self._remove_card)
+            if pdb_path:
+                c._pdb.set(pdb_path)
         c.pack(fill="x", pady=6)
         self._cards.append(c)
 
@@ -723,16 +784,170 @@ class PPM3App(tk.Tk):
         for c in self._cards:
             c.destroy()
         self._cards = []
+        self._bulk_active = False
+        self._bulk_pdbs = []
+        self._bulk_info.set("No batch folder imported.")
         self._add_card()
 
     def _switch_mode(self):
         for c in self._cards:
             c.destroy()
         self._cards = []
-        self._add_card()
+        self._render_batch_controls()
+        if self._bulk_active and self._bulk_pdbs:
+            mode_name = "Single membrane" if self._mode.get() == 1 else "Two membranes"
+            self._bulk_info.set(f"{len(self._bulk_pdbs)} PDB files imported (batch mode, {mode_name}).")
+            self._refresh_jobs_layout()
+        else:
+            self._add_card()
+
+    def _render_batch_controls(self):
+        for w in self._batch_cfg.winfo_children():
+            if w is not None:
+                w.destroy()
+        tk.Label(self._batch_cfg, text="Batch settings (used for imported/selected PDB files):",
+                 bg=C["panel"], fg=C["dim"], font=F["small"]).grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        tk.Checkbutton(self._batch_cfg, text="Include non-solvent heteroatoms",
+                       variable=self._bulk_het, bg=C["panel"], fg=C["text"],
+                       selectcolor=C["panel"], activebackground=C["panel"],
+                       font=F["small"]).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        r = 2
+        if self._mode.get() == 1:
+            tk.Label(self._batch_cfg, text="Membrane type:", bg=C["panel"], fg=C["text"], font=F["small"]).grid(
+                row=r, column=0, sticky="e", padx=(0, 8))
+            ttk.Combobox(self._batch_cfg, textvariable=self._bulk_mem, values=MEM_DISPLAY,
+                         state="readonly", font=F["small"], width=38).grid(row=r, column=1, sticky="w")
+            r += 1
+            tk.Label(self._batch_cfg, text="N-term topology:", bg=C["panel"], fg=C["text"], font=F["small"]).grid(
+                row=r, column=0, sticky="e", padx=(0, 8))
+            tk.Radiobutton(self._batch_cfg, text="in", variable=self._bulk_topo, value="in",
+                           bg=C["panel"], fg=C["text"], selectcolor=C["panel"],
+                           activebackground=C["panel"], font=F["small"]).grid(row=r, column=1, sticky="w")
+            tk.Radiobutton(self._batch_cfg, text="out", variable=self._bulk_topo, value="out",
+                           bg=C["panel"], fg=C["text"], selectcolor=C["panel"],
+                           activebackground=C["panel"], font=F["small"]).grid(row=r, column=2, sticky="w")
+        else:
+            def membr_block(row, title, mem_var, shape_var, topo_var):
+                tk.Label(self._batch_cfg, text=title, bg=C["panel"], fg=C["green"], font=F["h2"]).grid(
+                    row=row, column=0, columnspan=4, sticky="w", pady=(4, 2))
+                tk.Label(self._batch_cfg, text="Membrane type:", bg=C["panel"], fg=C["text"], font=F["small"]).grid(
+                    row=row+1, column=0, sticky="e", padx=(0, 8))
+                ttk.Combobox(self._batch_cfg, textvariable=mem_var, values=MEM_DISPLAY,
+                             state="readonly", font=F["small"], width=38).grid(row=row+1, column=1, columnspan=3, sticky="w")
+                tk.Label(self._batch_cfg, text="Membrane shape:", bg=C["panel"], fg=C["text"], font=F["small"]).grid(
+                    row=row+2, column=0, sticky="e", padx=(0, 8))
+                tk.Radiobutton(self._batch_cfg, text="Planar", variable=shape_var, value="planar",
+                               bg=C["panel"], fg=C["text"], selectcolor=C["panel"],
+                               activebackground=C["panel"], font=F["small"]).grid(row=row+2, column=1, sticky="w")
+                tk.Radiobutton(self._batch_cfg, text="Curved", variable=shape_var, value="curved",
+                               bg=C["panel"], fg=C["text"], selectcolor=C["panel"],
+                               activebackground=C["panel"], font=F["small"]).grid(row=row+2, column=2, sticky="w")
+                tk.Label(self._batch_cfg, text="N-term topology:", bg=C["panel"], fg=C["text"], font=F["small"]).grid(
+                    row=row+3, column=0, sticky="e", padx=(0, 8))
+                tk.Radiobutton(self._batch_cfg, text="in", variable=topo_var, value="in",
+                               bg=C["panel"], fg=C["text"], selectcolor=C["panel"],
+                               activebackground=C["panel"], font=F["small"]).grid(row=row+3, column=1, sticky="w")
+                tk.Radiobutton(self._batch_cfg, text="out", variable=topo_var, value="out",
+                               bg=C["panel"], fg=C["text"], selectcolor=C["panel"],
+                               activebackground=C["panel"], font=F["small"]).grid(row=row+3, column=2, sticky="w")
+                return row + 4
+
+            r = membr_block(r, "Membrane 1", self._bulk_mem1, self._bulk_shape1, self._bulk_topo1)
+            r = membr_block(r, "Membrane 2", self._bulk_mem2, self._bulk_shape2, self._bulk_topo2)
+
+        self._bulk_info.set(self._bulk_info.get())
+        tk.Label(self._batch_cfg, textvariable=self._bulk_info, bg=C["panel"], fg=C["dim"],
+                 font=F["small"]).grid(row=r+1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+    def _import_pdb_folder(self):
+        folder = filedialog.askdirectory(title="Select folder with PDB files")
+        if not folder:
+            return
+        try:
+            pdbs = sorted(
+                str(p) for p in Path(folder).iterdir()
+                if p.is_file() and p.suffix.lower() == ".pdb")
+        except Exception as e:
+            messagebox.showerror("Folder Error", str(e))
+            return
+
+        if not pdbs:
+            messagebox.showinfo("No PDB Files", "No .pdb files found in selected folder.")
+            return
+
+        for c in self._cards:
+            c.destroy()
+        self._cards = []
+        self._bulk_pdbs = pdbs
+        self._bulk_active = True
+        self._refresh_jobs_layout()
+
+        mode_name = "Single membrane" if self._mode.get() == 1 else "Two membranes"
+        self._bulk_info.set(f"{len(pdbs)} PDB files imported (batch mode, {mode_name}).")
+        self._status.set(f"Loaded {len(pdbs)} PDB files in batch mode.")
+        self._log_write(
+            f"\nImported {len(pdbs)} PDB files from:\n  {folder}\n"
+            f"Mode: {mode_name}\n",
+            "section")
+
+    def _import_pdb_files(self):
+        files = filedialog.askopenfilenames(
+            title="Select PDB file(s)",
+            filetypes=[("PDB files", "*.pdb"), ("All files", "*.*")]
+        )
+        if not files:
+            return
+        pdbs = sorted(str(Path(p)) for p in files if str(p).lower().endswith(".pdb"))
+        if not pdbs:
+            messagebox.showinfo("No PDB Files", "No .pdb files selected.")
+            return
+        for c in self._cards:
+            c.destroy()
+        self._cards = []
+        self._bulk_pdbs = pdbs
+        self._bulk_active = True
+        self._refresh_jobs_layout()
+        mode_name = "Single membrane" if self._mode.get() == 1 else "Two membranes"
+        self._bulk_info.set(f"{len(pdbs)} PDB files selected (batch mode, {mode_name}).")
+        self._status.set(f"Loaded {len(pdbs)} PDB files in batch mode.")
+        self._log_write(
+            f"\nSelected {len(pdbs)} PDB files manually.\nMode: {mode_name}\n",
+            "section")
+
+    def _get_selected_pdb_paths(self):
+        if self._bulk_active and self._bulk_pdbs:
+            return list(self._bulk_pdbs)
+        return [c.get_pdb_path() for c in self._cards]
 
     # ── Input file builder ─────────────────────────────────────────────────────
     def _build_inp(self):
+        if self._bulk_active and self._bulk_pdbs:
+            het = self._bulk_het.get()
+            if self._mode.get() == 1:
+                code = MEM_TO_CODE.get(self._bulk_mem.get(), "MOM").strip() or "MOM"
+                topo = self._bulk_topo.get().strip() or "in"
+                lines = [f"{het:2d} {code:<3} {topo:<3} {os.path.basename(p)}" for p in self._bulk_pdbs]
+                return "1\n" + "\n".join(lines) + "\n"
+            yesno = "yes" if het == 1 else "no"
+            code1 = MEM_TO_CODE.get(self._bulk_mem1.get(), "MOM").strip() or "MOM"
+            code2 = MEM_TO_CODE.get(self._bulk_mem2.get(), "MOM").strip() or "MOM"
+            lines = ["2"]
+            for p in self._bulk_pdbs:
+                lines.extend([
+                    yesno,
+                    os.path.basename(p),
+                    "2",
+                    code1,
+                    self._bulk_shape1.get(),
+                    self._bulk_topo1.get(),
+                    "",
+                    code2,
+                    self._bulk_shape2.get(),
+                    self._bulk_topo2.get(),
+                    "",
+                ])
+            return "\n".join(lines) + "\n"
         if self._mode.get() == 1:
             return "1\n" + "\n".join(c.to_inp_line() for c in self._cards) + "\n"
         else:
@@ -753,8 +968,7 @@ class PPM3App(tk.Tk):
             errs.append("• res.lib not found.")
         if not os.path.isdir(workdir):
             errs.append("• Working directory does not exist.")
-        for c in self._cards:
-            p = c.get_pdb_path()
+        for p in self._get_selected_pdb_paths():
             if not p:
                 errs.append("• One or more PDB paths are empty.")
                 break
@@ -774,8 +988,7 @@ class PPM3App(tk.Tk):
         try:
             os.makedirs(run_dir, exist_ok=False)
             shutil.copy(reslib, os.path.join(run_dir, "res.lib"))
-            for c in self._cards:
-                p = c.get_pdb_path()
+            for p in self._get_selected_pdb_paths():
                 if p:
                     shutil.copy(p, os.path.join(run_dir, os.path.basename(p)))
         except Exception as e:
@@ -789,6 +1002,7 @@ class PPM3App(tk.Tk):
         self._log_write(f"Run folder: {run_dir}\n", "info")
 
         self._running = True
+        self._run_output_lines = []
         self._run_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
         self._prog.start(12)
@@ -805,6 +1019,7 @@ class PPM3App(tk.Tk):
                 self._proc.stdin.write(inp)
                 self._proc.stdin.close()
                 for line in self._proc.stdout:
+                    self._run_output_lines.append(line.rstrip("\n"))
                     self.after(0, self._log_write, line, "info")
                 self._proc.wait()
                 self.after(0, self._on_done, self._proc.returncode, run_dir)
@@ -844,6 +1059,9 @@ class PPM3App(tk.Tk):
         out_pdbs = [f for f in os.listdir(workdir) if f.endswith("out.pdb")]
         if out_pdbs:
             parts.append("Output PDBs:\n" + "\n".join(f"  • {f}" for f in out_pdbs))
+            report_files = self._generate_html_reports(workdir, out_pdbs)
+            if report_files:
+                parts.append("Generated Reports:\n" + "\n".join(f"  • {f}" for f in report_files))
         if parts:
             summary = "\n\n".join(parts)
             self._res_lbl.config(text=summary, fg=C["text"])
@@ -853,6 +1071,187 @@ class PPM3App(tk.Tk):
                 text="Run completed but no result files found yet.\n"
                      "Check the working directory.",
                 fg=C["orange"])
+
+    def _parse_datapar1(self, workdir):
+        rows = {}
+        fp = os.path.join(workdir, "datapar1")
+        if not os.path.isfile(fp):
+            return rows
+        for line in open(fp):
+            s = line.strip()
+            if not s:
+                continue
+            parts = [p.strip() for p in s.split(";")]
+            if len(parts) < 7:
+                continue
+            pdb = parts[0]
+            rows[pdb] = {
+                "thickness": parts[1],
+                "thickness_pm": parts[2],
+                "tilt": parts[3],
+                "tilt_pm": parts[4],
+                "dG": parts[5],
+            }
+        return rows
+
+    def _parse_datasub1(self, workdir):
+        rows = {}
+        fp = os.path.join(workdir, "datasub1")
+        if not os.path.isfile(fp):
+            return rows
+        for line in open(fp):
+            s = line.strip()
+            if not s:
+                continue
+            parts = [p.strip() for p in s.split(";")]
+            if len(parts) < 4:
+                continue
+            pdb, sub, tilt, segs = parts[0], parts[1], parts[2], parts[3]
+            rows.setdefault(pdb, []).append({
+                "subunit": sub,
+                "tilt": tilt,
+                "segments": segs,
+            })
+        return rows
+
+    def _parse_embedded_residues(self):
+        rows = {}
+        rx = re.compile(r"^#([^;]+);([^;]+);([^;]+);(.+)$")
+        for ln in self._run_output_lines:
+            m = rx.match(ln.strip())
+            if not m:
+                continue
+            pdb_id, sub, tilt, residues = m.groups()
+            pdb = f"{pdb_id}.pdb"
+            rows.setdefault(pdb, []).append({
+                "subunit": sub,
+                "tilt": tilt.strip(),
+                "residues": residues.strip(),
+            })
+        return rows
+
+    def _infer_input_pdb_from_out(self, out_pdb):
+        if out_pdb.endswith("out.pdb"):
+            return out_pdb[:-7] + ".pdb"
+        return out_pdb
+
+    def _render_report_html(self, out_pdb, param, embedded_rows, seg_rows, message):
+        param_row = (
+            f"<tr><td>{escape(param.get('thickness', '-'))} ± {escape(param.get('thickness_pm', '-'))} Å</td>"
+            f"<td>{escape(param.get('dG', '-'))} kcal/mol</td>"
+            f"<td>{escape(param.get('tilt', '-'))} ± {escape(param.get('tilt_pm', '-'))}°</td></tr>"
+            if param else
+            "<tr><td colspan='3'>No parameter row found</td></tr>"
+        )
+
+        emb_rows_html = "".join(
+            f"<tr><td>{escape(r['subunit'])}</td><td>{escape(r['tilt'])}</td><td>{escape(r['residues'])}</td></tr>"
+            for r in embedded_rows
+        ) or "<tr><td colspan='3'>No embedded residue rows found</td></tr>"
+
+        seg_rows_html = "".join(
+            f"<tr><td>{escape(r['subunit'])}</td><td>{escape(r['tilt'])}</td><td>{escape(r['segments'])}</td></tr>"
+            for r in seg_rows
+        ) or "<tr><td colspan='3'>No transmembrane segment rows found</td></tr>"
+
+        return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>{escape(out_pdb)} report</title>
+  <style>
+    body {{ font-family: Arial, Helvetica, sans-serif; background:#f2f4f6; color:#1a1a1a; }}
+    .wrap {{ width: 920px; margin: 20px auto; }}
+    h1, h2 {{ color:#0b58b0; text-align:center; margin: 8px 0; }}
+    table {{ width: 100%; border-collapse: collapse; background:#fff; margin: 8px 0 16px; }}
+    th, td {{ border: 1px solid #c8cdd2; padding: 8px; text-align:center; }}
+    th {{ background:#e6edf5; color:#0a4a91; }}
+    .section {{ background:#eef3f8; font-weight: bold; color:#0a4a91; }}
+    .msg {{ text-align:left; font-family: "Courier New", monospace; white-space: pre-wrap; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Parameters of Protein in Membrane</h1>
+    <table>
+      <tr><th>Depth/Hydrophobic Thickness</th><th>ΔG<sub>transfer</sub></th><th>Tilt Angle</th></tr>
+      {param_row}
+    </table>
+
+    <h2>Membrane Embedded Residues (in Hydrocarbon Core)</h2>
+    <table>
+      <tr><th>Subunits</th><th>Tilt</th><th>Embedded residues</th></tr>
+      {emb_rows_html}
+      <tr><td class="section" colspan="3">Transmembrane secondary structure segments</td></tr>
+      <tr><th>Subunits</th><th>Tilt</th><th>Segments</th></tr>
+      {seg_rows_html}
+    </table>
+
+    <table>
+      <tr><th>Output Messages</th></tr>
+      <tr><td class="msg">{escape(message)}</td></tr>
+    </table>
+  </div>
+</body>
+</html>
+"""
+
+    def _generate_html_reports(self, workdir, out_pdbs):
+        datapar = self._parse_datapar1(workdir)
+        datasub = self._parse_datasub1(workdir)
+        embedded = self._parse_embedded_residues()
+        sections = []
+        for out_pdb in sorted(out_pdbs):
+            in_pdb = self._infer_input_pdb_from_out(out_pdb)
+            p = datapar.get(in_pdb, {})
+            e_rows = embedded.get(in_pdb, [])
+            s_rows = datasub.get(in_pdb, [])
+            msg = (
+                f"Protein: {in_pdb}\n"
+                f"Output: {out_pdb}\n"
+                f"emin={p.get('dG', '-')}, thickn={p.get('thickness', '-')}"
+                f"+-{p.get('thickness_pm', '-')}, tilt={p.get('tilt', '-')}"
+                f"+-{p.get('tilt_pm', '-')}"
+            )
+            section = self._render_report_html(out_pdb, p, e_rows, s_rows, msg)
+            section_body = section.split("<body>", 1)[1].rsplit("</body>", 1)[0].strip()
+            sections.append(section_body)
+
+        if not sections:
+            return []
+
+        all_html = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>PPM3 Combined Report</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; background:#f2f4f6; color:#1a1a1a; }
+    .wrap { width: 980px; margin: 20px auto; }
+    .card { background:#fff; border:1px solid #c8cdd2; margin: 0 0 24px; padding: 10px; }
+    h1, h2 { color:#0b58b0; text-align:center; margin: 8px 0; }
+    .run-title { text-align:center; color:#0a4a91; }
+    table { width: 100%; border-collapse: collapse; background:#fff; margin: 8px 0 16px; }
+    th, td { border: 1px solid #c8cdd2; padding: 8px; text-align:center; }
+    th { background:#e6edf5; color:#0a4a91; }
+    .section { background:#eef3f8; font-weight: bold; color:#0a4a91; }
+    .msg { text-align:left; font-family: "Courier New", monospace; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>PPM3 Combined Report</h1>
+    <div class="run-title">Run folder: """ + escape(workdir) + """</div>
+    """ + "\n".join(f'<div class="card">{s}</div>' for s in sections) + """
+  </div>
+</body>
+</html>
+"""
+        out_name = "ppm3_combined_report.html"
+        out_path = os.path.join(workdir, out_name)
+        with open(out_path, "w") as f:
+            f.write(all_html)
+        return [out_name]
 
     # ── Compile ────────────────────────────────────────────────────────────────
     def _compile_dialog(self):
@@ -868,10 +1267,16 @@ class PPM3App(tk.Tk):
                                    capture_output=True, text=True)
                 self.after(0, self._log_write, r.stdout or r.stderr, "info")
                 exe = os.path.join(src, "immers")
+                res = os.path.join(src, "res.lib")
                 if r.returncode == 0 and os.path.isfile(exe):
                     self.after(0, self._immers.set, exe)
+                    if os.path.isfile(res):
+                        self.after(0, self._reslib.set, res)
                     self.after(0, self._log_write,
                                f"\n✓ Compiled!  immers path set to:\n  {exe}\n", "ok")
+                    if os.path.isfile(res):
+                        self.after(0, self._log_write,
+                                   f"res.lib path set to:\n  {res}\n", "ok")
                 else:
                     self.after(0, self._log_write,
                                "\n✗ Compilation failed.\n", "error")
