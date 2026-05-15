@@ -4,7 +4,7 @@ PPM3 GUI — Positioning of Proteins in Membranes (v3.0)
 macOS M2 compatible. Pure stdlib — no pip installs needed.
 
 Launch:
-    python3 ppm3_gui4.py
+    python3 ppm3_gui.py
 """
 
 import tkinter as tk
